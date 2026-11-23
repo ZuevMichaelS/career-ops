@@ -39,11 +39,42 @@ try {
     fail(`comeet.detect() careers_url → ${JSON.stringify(cuHit)}`);
   }
 
-  // detect: a branded www.comeet.com/jobs page carries no token → not claimed
-  if (comeet.detect({ name: 'X', careers_url: 'https://www.comeet.com/jobs/spark-hire/30.005' }) === null) {
-    pass('comeet.detect() returns null for a branded careers page (no token)');
+  // detect: a public www.comeet.com/jobs/<slug>/<uid> page carries no token,
+  // but is now claimed through the page-scraping path.
+  const pageHit = comeet.detect({ name: 'X', careers_url: 'https://www.comeet.com/jobs/spark-hire/30.005' });
+  if (pageHit && pageHit.url === 'https://www.comeet.com/jobs/spark-hire/30.005') {
+    pass('comeet.detect() claims a public careers page via the page-scraping path');
   } else {
-    fail('comeet.detect() should not claim a tokenless branded careers page');
+    fail(`comeet.detect() should claim the public careers page → ${JSON.stringify(pageHit)}`);
+  }
+
+  // detect: a deeper permalink to one posting normalizes to the board root.
+  const deepHit = comeet.detect({ name: 'X', careers_url: 'https://www.comeet.com/jobs/spark-hire/30.005/ai-engineer/F1.B67' });
+  if (deepHit && deepHit.url === 'https://www.comeet.com/jobs/spark-hire/30.005') {
+    pass('comeet.detect() normalizes a deep posting permalink to the shallow board root');
+  } else {
+    fail(`comeet.detect() should normalize the deep permalink → ${JSON.stringify(deepHit)}`);
+  }
+
+  // detect: a bare www.comeet.com/jobs/<slug> with no company-uid segment is
+  // not a fetchable board root → not claimed.
+  if (comeet.detect({ name: 'X', careers_url: 'https://www.comeet.com/jobs/spark-hire' }) === null) {
+    pass('comeet.detect() returns null for a careers page missing the company-uid segment');
+  } else {
+    fail('comeet.detect() should not claim a careers page with no company-uid segment');
+  }
+
+  // detect: the careers-api token path still wins over the page path when an
+  // entry carries both (the token-gated fetch is cheaper and more direct).
+  const bothHit = comeet.detect({
+    name: 'X',
+    api: 'https://www.comeet.co/careers-api/2.0/company/30.005/positions?token=ABC',
+    careers_url: 'https://www.comeet.com/jobs/spark-hire/30.005',
+  });
+  if (bothHit && bothHit.url === 'https://www.comeet.co/careers-api/2.0/company/30.005/positions?token=REDACTED') {
+    pass('comeet.detect() prefers the careers-api token path over the page path');
+  } else {
+    fail(`comeet.detect() should prefer the token path → ${JSON.stringify(bothHit)}`);
   }
 
   if (comeet.detect({ name: 'X', careers_url: 'https://example.com/careers' }) === null) {

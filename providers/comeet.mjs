@@ -1,17 +1,46 @@
 // @ts-check
 /** @typedef {import('./_types.js').Provider} Provider */
 
-// Comeet (Spark Hire Recruit) provider — hits the public, no-auth careers API.
+import { coerceId } from './_ids.mjs';
+import { fetchTextWithRetry } from './_http.mjs';
+import { employmentTypeField } from './_employment-type.mjs';
+import { workplaceField } from './_workplace-type.mjs';
+
+// Comeet (Spark Hire Recruit) provider — two independent ways to read a board,
+// tried in this order:
 //
-// The positions endpoint needs BOTH a company-uid and a per-tenant token:
-//   https://www.comeet.co/careers-api/2.0/company/<uid>/positions?token=<token>
-// Neither is derivable from a branded careers URL, so unlike greenhouse/recruitee
-// there is no slug→API shortcut: the full API URL must be supplied via the
-// `api:` field (or pasted into `careers_url`). The API host is a single fixed
-// origin, so the SSRF defence pins hostname to www.comeet.co AND requires the
-// /careers-api/ path prefix (rather than a per-tenant subdomain regex).
+// 1. The token-gated careers-api, when the entry already carries it. The
+//    positions endpoint needs BOTH a company-uid and a per-tenant token:
+//      https://www.comeet.co/careers-api/2.0/company/<uid>/positions?token=<token>
+//    Neither is derivable from a branded careers URL, so unlike
+//    greenhouse/recruitee there is no slug→API shortcut: the full API URL
+//    must be supplied via the `api:` field (or pasted into `careers_url`).
+//    The API host is a single fixed origin, so the SSRF defence pins hostname
+//    to www.comeet.co AND requires the /careers-api/ path prefix (rather than
+//    a per-tenant subdomain regex).
+// 2. The public, no-auth careers PAGE, auto-detected from a
+//    https://www.comeet.com/jobs/<company-slug>/<company-uid> careers_url (the
+//    link a candidate actually has — no API token, no login). The page
+//    server-renders every posting into a `COMPANY_POSITIONS_DATA` JS array
+//    (a sibling `COMPANY_DATA` object carries company metadata plus a
+//    `token`/`linkedin_integrations_api_key` pair — the SAME per-tenant token
+//    the careers-api needs — which this path never reads, so there is nothing
+//    to redact here). Confirmed live on two real boards: the
+//    position shape matches the careers-api response (`location.name` /
+//    `location.is_remote`, `url_active_page` / `url_comeet_hosted_page`,
+//    `time_updated`) plus `department`, `employment_type` and
+//    `workplace_type`, which the careers-api fixture below never exercised.
+//    That the careers-api returns the identical extra fields is an
+//    assumption, not something this PR can confirm without a token — if a
+//    future contributor who holds one finds otherwise, the `department`
+//    fold-into-`description` and the employmentType/workplaceType mapping in
+//    parseComeetResponse are the two lines to recheck.
+//
+// Both paths share one id/detect/fetch and the same Job mapping
+// (parseComeetResponse), since a position row has the same shape either way.
 
 const COMEET_API_HOST = 'www.comeet.co';
+const COMEET_PAGE_HOST = 'www.comeet.com';
 
 /** @param {unknown} raw */
 function isComeetApiUrl(raw) {
@@ -57,11 +86,110 @@ function redactToken(url) {
 /** @param {import('./_types.js').PortalEntry} entry */
 function resolveApiUrl(entry) {
   if (isComeetApiUrl(entry.api)) return entry.api;
-  // Fall back to careers_url only when it already IS the full careers-api URL
-  // (the branded www.comeet.com/jobs/... page carries no token, so it can't be
-  // turned into an API call).
   if (isComeetApiUrl(entry.careers_url)) return entry.careers_url;
   return null;
+}
+
+/**
+ * The public careers PAGE: https://www.comeet.com/jobs/<slug>/<company-uid>,
+ * optionally with a deeper permalink to one posting appended
+ * (.../<title-slug>/<posting-uid>). Accepts either shape but always fetches
+ * the shallow 2-segment board root — the landing URL a candidate actually
+ * has (ADDING_A_PROVIDER.md: "accept the shallowest") — never a path built by
+ * hand, and never re-encodes a segment that is already a valid URL path
+ * component (same as greenhouse.mjs's board-slug extraction).
+ *
+ * @param {import('./_types.js').PortalEntry} entry
+ * @returns {string|null}
+ */
+function resolvePageUrl(entry) {
+  for (const raw of [entry.careers_url, entry.api]) {
+    if (typeof raw !== 'string' || !raw) continue;
+    let parsed;
+    try {
+      parsed = new URL(raw);
+    } catch {
+      continue;
+    }
+    if (parsed.protocol !== 'https:' || parsed.hostname !== COMEET_PAGE_HOST) continue;
+    const segs = parsed.pathname.split('/').filter(Boolean);
+    if (segs.length < 3 || segs[0] !== 'jobs' || !segs[1] || !segs[2]) continue;
+    return `https://${COMEET_PAGE_HOST}/jobs/${segs[1]}/${segs[2]}`;
+  }
+  return null;
+}
+
+// The page hydrates two sibling assignments; only the positions array is read
+// (see the header comment on why COMPANY_DATA is skipped entirely).
+const POSITIONS_START_RE = /COMPANY_POSITIONS_DATA\s*=\s*\[/;
+
+/**
+ * The JSON array assigned to COMPANY_POSITIONS_DATA, as source text. A
+ * bracket scan that skips string contents, so a title or department
+ * containing "]" can never end the scan early (same technique as
+ * appDataSource in ashby.mjs, generalized from `{}` to `[]`).
+ *
+ * @param {string} html
+ * @returns {string|null|undefined} the array text; null when the assignment
+ *   is absent; undefined when it starts but never closes.
+ */
+function positionsSource(html) {
+  const m = POSITIONS_START_RE.exec(html);
+  if (!m) return null;
+  const start = m.index + m[0].length - 1;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < html.length; i++) {
+    const c = html[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (c === '\\') escaped = true;
+      else if (c === '"') inString = false;
+    } else if (c === '"') {
+      inString = true;
+    } else if (c === '[') {
+      depth++;
+    } else if (c === ']' && --depth === 0) {
+      return html.slice(start, i + 1);
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Pull the raw positions array out of a public Comeet careers page.
+ *
+ * Fail closed (ADDING_A_PROVIDER.md, "Defensive parsing" — the HTML-scraper
+ * case): no COMPANY_POSITIONS_DATA assignment at all, or one that doesn't
+ * parse as JSON, means Comeet changed the page, and that must surface as a
+ * broken board, not a silent empty one. A present-and-empty `[]` is a
+ * genuinely empty board and is returned as-is; parseComeetResponse (shared
+ * with the careers-api path) maps it to `[]` either way.
+ *
+ * @param {string} html
+ * @param {string} companyName
+ * @returns {any[]}
+ */
+export function parseComeetPage(html, companyName) {
+  const source = positionsSource(html || '');
+  if (source === null) throw new Error(`comeet: ${companyName} careers page carried no COMPANY_POSITIONS_DATA — Comeet changed the page`);
+  let data;
+  try {
+    if (source === undefined) throw new Error('unterminated');
+    data = JSON.parse(source);
+  } catch {
+    throw new Error(`comeet: ${companyName} careers page COMPANY_POSITIONS_DATA did not parse as JSON — Comeet changed the page`);
+  }
+  if (!Array.isArray(data)) {
+    // COMPANY_POSITIONS_DATA is documented as an array; the regex above only
+    // matches a `[` opener, so this is unreachable in practice — kept as the
+    // same defensive, keys-naming throw every other provider uses rather
+    // than trusting the regex silently.
+    const got = data && typeof data === 'object' ? Object.keys(data).join(', ') : data === null ? 'null' : typeof data;
+    throw new Error(`comeet: ${companyName} careers page COMPANY_POSITIONS_DATA is not an array — got: [${got}]`);
+  }
+  return data;
 }
 
 // NaN-safe Date.parse — `|| undefined` would also coerce a valid epoch 0.
@@ -77,20 +205,34 @@ export default {
 
   detect(entry) {
     const apiUrl = resolveApiUrl(entry);
-    // The DetectHit url is informational (the framework may log it), so strip
-    // the secret ?token= before returning it — fetch() re-resolves the real
-    // URL from the entry, so redaction here is safe.
-    return apiUrl ? { url: redactToken(apiUrl) } : null;
+    if (apiUrl) {
+      // The DetectHit url is informational (the framework may log it), so
+      // strip the secret ?token= before returning it — fetch() re-resolves
+      // the real URL from the entry, so redaction here is safe.
+      return { url: redactToken(apiUrl) };
+    }
+    const pageUrl = resolvePageUrl(entry);
+    // No token to redact here — resolvePageUrl only ever returns the public
+    // board root, never a URL carrying ?token=.
+    return pageUrl ? { url: pageUrl } : null;
   },
 
   async fetch(entry, ctx) {
     const apiUrl = resolveApiUrl(entry);
-    if (!apiUrl) throw new Error(`comeet: cannot derive API URL for ${entry.name} (set api: to the full careers-api positions URL)`);
-    assertComeetUrl(apiUrl);
-    // redirect:'error' prevents SSRF via server-side redirects; combined with
-    // assertComeetUrl above it guarantees the final hostname stays www.comeet.co.
-    const json = await ctx.fetchJson(apiUrl, { redirect: 'error' });
-    return parseComeetResponse(json, entry.name);
+    if (apiUrl) {
+      assertComeetUrl(apiUrl);
+      // redirect:'error' prevents SSRF via server-side redirects; combined with
+      // assertComeetUrl above it guarantees the final hostname stays www.comeet.co.
+      const json = await ctx.fetchJson(apiUrl, { redirect: 'error' });
+      return parseComeetResponse(json, entry.name);
+    }
+    const pageUrl = resolvePageUrl(entry);
+    if (!pageUrl) throw new Error(`comeet: cannot derive a careers-api or careers-page URL for ${entry.name} (set api: to the full careers-api positions URL, or careers_url: to a https://${COMEET_PAGE_HOST}/jobs/<slug>/<uid> page)`);
+    // resolvePageUrl only ever returns a www.comeet.com origin it built
+    // itself; redirect:'error' still guards the one request this path makes.
+    const html = await fetchTextWithRetry(ctx, pageUrl, { redirect: 'error' });
+    const positions = parseComeetPage(html, entry.name);
+    return parseComeetResponse(positions, entry.name);
   },
 };
 
@@ -107,10 +249,18 @@ export default {
  *   they are NOT host-locked. Require a well-formed https: URL; a position whose
  *   two URLs are both missing/non-https/malformed is dropped (url is the dedup key).
  * - location: `location.name`, appending "Remote" when `location.is_remote`.
+ * - department: not a Job field (_types.js has none, and peoplesoft.mjs
+ *   dropped its own `department` field per review for exactly that reason) —
+ *   folded into `description` as a `Department: <name>` line instead, the
+ *   same convention collage.mjs/meituan.mjs/mokahr.mjs already use.
+ * - employmentType / workplaceType: mapped through the shared
+ *   `_employment-type.mjs` / `_workplace-type.mjs` normalizers from
+ *   `employment_type` ("Full-time") / `workplace_type` ("Hybrid", "On-site",
+ *   "Remote"); omitted when the source value doesn't normalize to a known one.
  *
  * @param {any} json
  * @param {string} companyName
- * @returns {Array<{title: string, url: string, company: string, location: string, postedAt?: number}>}
+ * @returns {Array<{title: string, url: string, company: string, location: string, description?: string, postedAt?: number, externalId?: string, employmentType?: string, workplaceType?: string}>}
  */
 export function parseComeetResponse(json, companyName) {
   // [] is an empty board. Any other body ({}, { error }, a bare string) is a
@@ -148,11 +298,17 @@ export function parseComeetResponse(json, companyName) {
         ? [base, remote].filter(Boolean).join(', ')
         : base;
 
+      const department = typeof j.department === 'string' ? j.department.trim() : '';
+
       return {
         title: (typeof j.name === 'string' ? j.name.trim() : ''),
         url,
         location,
         company: companyName,
+        externalId: coerceId(j.uid),
+        ...(department ? { description: `Department: ${department}` } : {}),
+        ...employmentTypeField(j.employment_type),
+        ...workplaceField(j.workplace_type),
         postedAt: toEpochMs(j.time_updated),
       };
     })
