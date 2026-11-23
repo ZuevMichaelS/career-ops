@@ -1383,7 +1383,7 @@ search_queries:
 #   turbohire       <tenant>.turbohire.co               (TurboHire careers page, any path; the org id is looked up from the subdomain)
 #   careerpuck      app.careerpuck.com/job-board/<permalink>   (CareerPuck board, any path under it; the list is read from api.careerpuck.com)
 #   solidjobs       solid.jobs/public-api/offers/<division>
-#   comeet          api: https://www.comeet.co/careers-api/2.0/company/<uid>/positions?token=<token>
+#   comeet          www.comeet.com/jobs/<slug>/<uid>   (public careers page, no token; or api: https://www.comeet.co/careers-api/2.0/company/<uid>/positions?token=<token>)
 #   personio        <slug>.jobs.personio.(de|com)
 #   pinpoint        <slug>.pinpointhq.com
 #   polymer         jobs.polymer.co/<slug>  (or api: https://api.polymer.co/v1/hire/organizations/<slug>/jobs)
@@ -2514,16 +2514,23 @@ search_queries:
 #     detailLimit: 25                     # 1..100, default 25
 #   enabled: true
 #
-# Comeet needs the full careers-api URL (it carries a per-tenant token that a
-# branded careers page does not expose), so set it via the api: field — e.g.:
+# Comeet auto-detects the public careers page — no token, no login — from
+# careers_url alone:
+#
+#   - name: Example Comeet Co
+#     careers_url: https://www.comeet.com/jobs/exampleco/30.005   # any www.comeet.com/jobs/<slug>/<uid> page
+#     enabled: true
+#
+# Pin the token-gated careers-api instead (skips the page-scraping request,
+# and the only way to read `department` reliably if a tenant's public page
+# ever disagrees with the API — see providers/comeet.mjs's header comment)
+# by setting api: to the full URL. Find <uid> and <token> in Comeet under
+# Settings → Sourcing → Careers Website → Integrated website → Careers API:
 #
 #   - name: Spark Hire
 #     careers_url: https://www.comeet.com/jobs/spark-hire/30.005
 #     api: https://www.comeet.co/careers-api/2.0/company/30.005/positions?token=YOUR_TOKEN
 #     enabled: true
-#
-# Find <uid> and <token> in Comeet under Settings → Sourcing → Careers Website →
-# Integrated website → Careers API.
 #
 # Personio (common across DACH/EU) auto-detects from its careers host and
 # reads the public no-auth careers page (XML feed at /xml as the fallback).
