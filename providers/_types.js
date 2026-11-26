@@ -23,8 +23,10 @@
  * @property {string} location May be empty.
  * @property {'remote' | 'hybrid' | 'onsite'} [workplaceType]
  *                               Workplace model, populated ONLY when the source
- *                               exposes a dedicated field (`ashby.mjs` and
- *                               `lever.mjs` are producers; most providers omit it).
+ *                               exposes a dedicated field (`ashby.mjs`, `lever.mjs`,
+ *                               `getro.mjs`, `a16z-speedrun-talent.mjs` and
+ *                               `consider.mjs`, from its `remote` and `hybrid`
+ *                               flags, are producers; most providers omit it).
  *                               Normalized to lowercase: 'remote' | 'hybrid' | 'onsite'.
  *                               Never inferred from location text, title, or
  *                               `isRemote`. Omitted when unknown or unspecified.
@@ -73,9 +75,9 @@
  *                               The posting's employment type, normalized by
  *                               `normalizeEmploymentType()` in
  *                               `_employment-type.mjs` from the source's own
- *                               field (Himalayas `employmentType`, We Work
- *                               Remotely `<type>`, Remotive `job_type`, Ashby
- *                               `employmentType`, Lever `categories.commitment`).
+ *                               field; templates/portals.example.yml
+ *                               (employment_type_filter) lists the providers
+ *                               that set it and the field each reads.
  *                               Set ONLY from a dedicated field, never read out
  *                               of the title or description. Omitted when the
  *                               source has no such field or its value names no
