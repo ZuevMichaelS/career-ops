@@ -90,10 +90,10 @@
 "📦 dependencies":
   - changed-files:
       - any-glob-to-any-file:
-          # The root package-lock.json is gitignored (d01925e9), so it is not
-          # listed. tests/labeler-globs.test.mjs checks this list against the
+          # tests/labeler-globs.test.mjs checks this list against the
           # tracked manifests and lockfiles.
           - package.json
+          - package-lock.json
           - dashboard/go.mod
           - dashboard/go.sum
           - scaffolder/package.json
